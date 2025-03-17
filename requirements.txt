@@ -1,0 +1,2 @@
+requests==2.31.0
+fcntl==1.0.0  # For Unix-based systems; not needed for Windows
