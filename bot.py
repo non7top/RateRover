@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
@@ -11,11 +12,19 @@ import pytz
 # Load environment variables from .env file
 load_dotenv()
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 class ExchangeRateBot:
     def __init__(self):
         # Get the bot token from the environment variable
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
         if not self.bot_token:
+            logger.error("TELEGRAM_BOT_TOKEN environment variable is not set.")
             raise ValueError("Please set the TELEGRAM_BOT_TOKEN environment variable in the .env file.")
 
         # Initialize the bot application
@@ -31,31 +40,46 @@ class ExchangeRateBot:
         # Initialize the scheduler
         self.scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Bangkok"))
 
+        # Load exchange rates initially
+        self.exchange_rates = self.load_exchange_rates()
+
     async def post_init(self, application: Application):
         """Set up bot commands using set_my_commands."""
         await application.bot.set_my_commands([
             ("start", "Start the bot and subscribe to daily rates"),
             ("rates", "Get the latest exchange rates"),
         ])
+        logger.info("Bot commands have been set up.")
 
     def init_db(self):
         """Initialize the SQLite database to store user chat IDs."""
-        self.conn = sqlite3.connect("users.db")
-        self.cursor = self.conn.cursor()
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                chat_id INTEGER PRIMARY KEY
-            )
-        """)
-        self.conn.commit()
+        try:
+            self.conn = sqlite3.connect("users.db")
+            self.cursor = self.conn.cursor()
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id INTEGER PRIMARY KEY
+                )
+            """)
+            self.conn.commit()
+            logger.info("Database initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {e}")
+            raise
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler for the /start command."""
         chat_id = update.message.chat_id
 
         # Save the user's chat ID to the database if not already present
-        self.cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-        self.conn.commit()
+        try:
+            self.cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+            self.conn.commit()
+            logger.info(f"User {chat_id} started the bot.")
+        except Exception as e:
+            logger.error(f"Failed to save user {chat_id} to the database: {e}")
+            await update.message.reply_text("An error occurred. Please try again later.")
+            return
 
         await update.message.reply_text(
             "Welcome! You will now receive daily exchange rates for USD, RUB, and EUR at 10 AM Bangkok time.\n\n"
@@ -64,42 +88,59 @@ class ExchangeRateBot:
 
     def load_exchange_rates(self):
         """Load the exchange rates from the JSON file."""
-        with open("exchange_rates.json", "r") as file:
-            data = json.load(file)
-        return data
+        try:
+            with open("exchange_rates.json", "r") as file:
+                data = json.load(file)
+            logger.info("Exchange rates loaded successfully.")
+            return data
+        except Exception as e:
+            logger.error(f"Failed to load exchange rates: {e}")
+            raise
 
-    def get_latest_rates(self, data):
+    def reload_exchange_rates(self):
+        """Reload the exchange rates from the JSON file."""
+        try:
+            self.exchange_rates = self.load_exchange_rates()
+            logger.info(f"Exchange rates reloaded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        except Exception as e:
+            logger.error(f"Failed to reload exchange rates: {e}")
+
+    def get_latest_rates(self):
         """Get the latest date and rates for USD, RUB, and EUR."""
-        # Get the latest date (assuming the JSON is sorted by date)
-        sorted_dates = sorted(data.keys(), reverse=True)
-        latest_date = sorted_dates[0]
-        previous_date = sorted_dates[1] if len(sorted_dates) > 1 else None
+        try:
+            # Get the latest date (assuming the JSON is sorted by date)
+            sorted_dates = sorted(self.exchange_rates.keys(), reverse=True)
+            latest_date = sorted_dates[0]
+            previous_date = sorted_dates[1] if len(sorted_dates) > 1 else None
 
-        latest_rates = data[latest_date]["rates"]
-        previous_rates = data[previous_date]["rates"] if previous_date else None
+            latest_rates = self.exchange_rates[latest_date]["rates"]
+            previous_rates = self.exchange_rates[previous_date]["rates"] if previous_date else None
 
-        # Extract USD, RUB, and EUR rates
-        usd = latest_rates.get("USD", {})
-        rub = latest_rates.get("RUB", {})
-        eur = latest_rates.get("EUR", {})
+            # Extract USD, RUB, and EUR rates
+            usd = latest_rates.get("USD", {})
+            rub = latest_rates.get("RUB", {})
+            eur = latest_rates.get("EUR", {})
 
-        # Compare with previous rates
-        def get_trend(current, previous, key):
-            if not previous or key not in previous:
+            # Compare with previous rates
+            def get_trend(current, previous, key):
+                if not previous or key not in previous:
+                    return ""
+                current_rate = current.get(key, 0)
+                previous_rate = previous.get(key, {}).get(key, 0)
+                if current_rate > previous_rate:
+                    return '<span style="color: green;">↑</span>'  # Green up arrow
+                elif current_rate < previous_rate:
+                    return '<span style="color: red;">↓</span>'  # Red down arrow
                 return ""
-            current_rate = current.get(key, 0)
-            previous_rate = previous.get(key, {}).get(key, 0)
-            if current_rate > previous_rate:
-                return '<span style="color: green;">↑</span>'  # Green up arrow
-            elif current_rate < previous_rate:
-                return '<span style="color: red;">↓</span>'  # Red down arrow
-            return ""
 
-        usd_trend = get_trend(usd, previous_rates.get("USD") if previous_rates else None, "buyingRate")
-        rub_trend = get_trend(rub, previous_rates.get("RUB") if previous_rates else None, "buyingRate")
-        eur_trend = get_trend(eur, previous_rates.get("EUR") if previous_rates else None, "buyingRate")
+            usd_trend = get_trend(usd, previous_rates.get("USD") if previous_rates else None, "buyingRate")
+            rub_trend = get_trend(rub, previous_rates.get("RUB") if previous_rates else None, "buyingRate")
+            eur_trend = get_trend(eur, previous_rates.get("EUR") if previous_rates else None, "buyingRate")
 
-        return latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend
+            return latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend
+        except Exception as e:
+            logger.error(f"Failed to get latest rates: {e}")
+            raise
 
     def format_rates_message(self, latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend):
         """Format the exchange rates into a message."""
@@ -118,41 +159,48 @@ class ExchangeRateBot:
 
     async def send_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler for the /rates command."""
-        data = self.load_exchange_rates()
-        latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend = self.get_latest_rates(data)
-
-        # Format the message
-        message = self.format_rates_message(latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend)
-
-        # Send the message to the user who issued the /rates command
-        await update.message.reply_text(message, parse_mode="HTML")
+        try:
+            latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend = self.get_latest_rates()
+            message = self.format_rates_message(latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend)
+            await update.message.reply_text(message, parse_mode="HTML")
+            logger.info(f"Rates sent to user {update.message.chat_id}.")
+        except Exception as e:
+            logger.error(f"Failed to send rates to user {update.message.chat_id}: {e}")
+            await update.message.reply_text("An error occurred. Please try again later.")
 
     async def send_daily_rates(self):
         """Send the daily exchange rates to all registered users."""
-        data = self.load_exchange_rates()
-        latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend = self.get_latest_rates(data)
+        try:
+            latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend = self.get_latest_rates()
+            message = self.format_rates_message(latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend)
 
-        # Format the message
-        message = self.format_rates_message(latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend)
-
-        # Send the message to all registered users
-        self.cursor.execute("SELECT chat_id FROM users")
-        users = self.cursor.fetchall()
-        for user in users:
-            chat_id = user[0]
-            await self.application.bot.send_message(
-                chat_id=chat_id,
-                text=message,
-                parse_mode="HTML"  # Enable HTML formatting
-            )
+            self.cursor.execute("SELECT chat_id FROM users")
+            users = self.cursor.fetchall()
+            for user in users:
+                chat_id = user[0]
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="HTML"  # Enable HTML formatting
+                )
+            logger.info(f"Daily rates sent to {len(users)} users.")
+        except Exception as e:
+            logger.error(f"Failed to send daily rates: {e}")
 
     def run(self):
         """Run the bot."""
-        print("Bot is running...")
-        # Start the scheduler after the bot is running
-        self.application.run_polling()
-        self.scheduler.add_job(self.send_daily_rates, "cron", hour=10, minute=0)
-        self.scheduler.start()
+        try:
+            # Start the scheduler
+            self.scheduler.add_job(self.send_daily_rates, "cron", hour=10, minute=0)
+            self.scheduler.add_job(self.reload_exchange_rates, "cron", minute=10)  # Reload rates every hour at the 10th minute
+            self.scheduler.start()
+
+            # Start the bot
+            logger.info("Bot is running...")
+            self.application.run_polling()
+        except Exception as e:
+            logger.error(f"Failed to run the bot: {e}")
+            raise
 
 if __name__ == "__main__":
     bot = ExchangeRateBot()
