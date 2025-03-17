@@ -1,2 +1,5 @@
-requests==2.31.0
-fcntl==1.0.0  # For Unix-based systems; not needed for Windows
+requests==2.32.3
+python-telegram-bot==22.0
+apscheduler==3.11.0
+python-dotenv==1.0.1
+pytz==2025.1
