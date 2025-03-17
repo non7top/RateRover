@@ -187,14 +187,16 @@ class ExchangeRateBot:
         except Exception as e:
             logger.error(f"Failed to send daily rates: {e}")
 
+    async def start_scheduler(self):
+        """Start the scheduler after the bot is running."""
+        self.scheduler.add_job(self.send_daily_rates, "cron", hour=10, minute=0)
+        self.scheduler.add_job(self.reload_exchange_rates, "cron", minute=10)  # Reload rates every hour at the 10th minute
+        self.scheduler.start()
+        logger.info("Scheduler started.")
+
     def run(self):
         """Run the bot."""
         try:
-            # Start the scheduler
-            self.scheduler.add_job(self.send_daily_rates, "cron", hour=10, minute=0)
-            self.scheduler.add_job(self.reload_exchange_rates, "cron", minute=10)  # Reload rates every hour at the 10th minute
-            self.scheduler.start()
-
             # Start the bot
             logger.info("Bot is running...")
             self.application.run_polling()
@@ -204,4 +206,8 @@ class ExchangeRateBot:
 
 if __name__ == "__main__":
     bot = ExchangeRateBot()
-    bot.run()
+    # Start the scheduler after the bot is running
+    bot.application.run_polling()
+    bot.scheduler.add_job(bot.send_daily_rates, "cron", hour=10, minute=0)
+    bot.scheduler.add_job(bot.reload_exchange_rates, "cron", minute=10)
+    bot.scheduler.start()
