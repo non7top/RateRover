@@ -32,13 +32,16 @@ class ExchangeRateBot:
 
         # Add command handlers
         self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("rates", self.send_rates))  # Add /rates handler
+        self.application.add_handler(CommandHandler("rates", self.send_rates))
+        self.application.add_handler(CommandHandler("settimezone", self.set_timezone))
+        self.application.add_handler(CommandHandler("unsubscribe", self.unsubscribe))
+        self.application.add_handler(CommandHandler("listtimezones", self.list_timezones))
 
         # Initialize the database
         self.init_db()
 
         # Initialize the scheduler
-        self.scheduler = AsyncIOScheduler(timezone=pytz.timezone("Asia/Bangkok"))
+        self.scheduler = AsyncIOScheduler()
 
         # Load exchange rates initially
         self.exchange_rates = self.load_exchange_rates()
@@ -48,17 +51,34 @@ class ExchangeRateBot:
         await application.bot.set_my_commands([
             ("start", "Start the bot and subscribe to daily rates"),
             ("rates", "Get the latest exchange rates"),
+            ("settimezone", "Set your preferred timezone (e.g., /settimezone Asia/Bangkok)"),
+            ("unsubscribe", "Unsubscribe from daily updates"),
+            ("listtimezones", "List all available timezones"),
         ])
         logger.info("Bot commands have been set up.")
 
     def init_db(self):
-        """Initialize the SQLite database to store user chat IDs."""
+        """Initialize the SQLite database to store user chat IDs and timezones."""
         try:
             self.conn = sqlite3.connect("users.db")
             self.cursor = self.conn.cursor()
+
+            # Check if the `timezone` column exists
+            self.cursor.execute("PRAGMA table_info(users)")
+            columns = self.cursor.fetchall()
+            column_names = [column[1] for column in columns]
+
+            if "timezone" not in column_names:
+                # Add the `timezone` column if it doesn't exist
+                self.cursor.execute("ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'Asia/Bangkok'")
+                self.conn.commit()
+                logger.info("Added 'timezone' column to the users table.")
+
+            # Create the users table if it doesn't exist
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    chat_id INTEGER PRIMARY KEY
+                    chat_id INTEGER PRIMARY KEY,
+                    timezone TEXT DEFAULT 'Asia/Bangkok'
                 )
             """)
             self.conn.commit()
@@ -82,9 +102,47 @@ class ExchangeRateBot:
             return
 
         await update.message.reply_text(
-            "Welcome! You will now receive daily exchange rates for USD, RUB, and EUR at 10 AM Bangkok time.\n\n"
-            "Use /rates to get the latest exchange rates at any time."
+            "Welcome! You will now receive daily exchange rates for USD, RUB, and EUR at 10 AM in your preferred timezone.\n\n"
+            "Use /settimezone to set your timezone (e.g., /settimezone Asia/Bangkok).\n"
+            "Use /rates to get the latest exchange rates at any time.\n"
+            "Use /unsubscribe to stop receiving daily updates.\n"
+            "Use /listtimezones to see all available timezones."
         )
+
+    async def set_timezone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handler for the /settimezone command."""
+        chat_id = update.message.chat_id
+        timezone = context.args[0] if context.args else None
+
+        if timezone and timezone in pytz.all_timezones:
+            try:
+                self.cursor.execute("UPDATE users SET timezone = ? WHERE chat_id = ?", (timezone, chat_id))
+                self.conn.commit()
+                await update.message.reply_text(f"Your timezone has been set to {timezone}.")
+                logger.info(f"User {chat_id} set timezone to {timezone}.")
+            except Exception as e:
+                logger.error(f"Failed to update timezone for user {chat_id}: {e}")
+                await update.message.reply_text("An error occurred. Please try again later.")
+        else:
+            await update.message.reply_text("Invalid timezone. Please provide a valid timezone (e.g., /settimezone Asia/Bangkok).")
+
+    async def unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handler for the /unsubscribe command."""
+        chat_id = update.message.chat_id
+
+        try:
+            self.cursor.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+            self.conn.commit()
+            await update.message.reply_text("You have been unsubscribed from daily updates.")
+            logger.info(f"User {chat_id} unsubscribed.")
+        except Exception as e:
+            logger.error(f"Failed to unsubscribe user {chat_id}: {e}")
+            await update.message.reply_text("An error occurred. Please try again later.")
+
+    async def list_timezones(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handler for the /listtimezones command."""
+        timezones = "\n".join(pytz.all_timezones)
+        await update.message.reply_text(f"Available timezones:\n\n{timezones}")
 
     def load_exchange_rates(self):
         """Load the exchange rates from the JSON file."""
@@ -97,7 +155,7 @@ class ExchangeRateBot:
             logger.error(f"Failed to load exchange rates: {e}")
             raise
 
-    async def reload_exchange_rates(self, *args):
+    async def reload_exchange_rates(self, context: ContextTypes.DEFAULT_TYPE):
         """Reload the exchange rates from the JSON file."""
         try:
             self.exchange_rates = self.load_exchange_rates()
@@ -168,29 +226,43 @@ class ExchangeRateBot:
             logger.exception(f"Failed to send rates to user {update.message.chat_id}: {e}")
             await update.message.reply_text("An error occurred. Please try again later.")
 
-    async def send_daily_rates(self, *args):
-        """Send the daily exchange rates to all registered users."""
+    async def send_hourly_rates(self, context: ContextTypes.DEFAULT_TYPE):
+        """Send the hourly exchange rates to users whose timezone matches the current hour."""
         try:
             latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend = self.get_latest_rates()
             message = self.format_rates_message(latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend)
 
-            self.cursor.execute("SELECT chat_id FROM users")
+            # Get the current time in UTC
+            now_utc = datetime.now(pytz.utc)
+
+            # Fetch users whose timezone matches the current hour
+            self.cursor.execute("SELECT chat_id, timezone FROM users")
             users = self.cursor.fetchall()
             for user in users:
-                chat_id = user[0]
-                await self.application.bot.send_message(
-                    chat_id=chat_id,
-                    text=message,
-                    parse_mode="HTML"  # Enable HTML formatting
-                )
-            logger.info(f"Daily rates sent to {len(users)} users.")
+                chat_id, timezone = user
+                try:
+                    tz = pytz.timezone(timezone)
+                    now_local = now_utc.astimezone(tz)
+                    if now_local.hour == 10 and now_local.minute == 0:  # Send at 10:00 in the user's timezone
+                        await self.application.bot.send_message(
+                            chat_id=chat_id,
+                            text=message,
+                            parse_mode="HTML"
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to send hourly rates to user {chat_id}: {e}")
+            logger.info(f"Hourly rates sent to users.")
         except Exception as e:
-            logger.error(f"Failed to send daily rates: {e}")
+            logger.error(f"Failed to send hourly rates: {e}")
 
     def start_scheduler(self):
         """Start the scheduler after the bot is running."""
-        self.application.job_queue.run_repeating(self.send_daily_rates, interval=600, first=10)
-        self.application.job_queue.run_repeating(self.reload_exchange_rates, interval=1800, first=5)
+        # Schedule send_hourly_rates to run every hour at the 10th minute
+        self.application.job_queue.run_repeating(self.send_hourly_rates, interval=3600, first=10)
+
+        # Schedule reload_exchange_rates to run every hour at the 5th minute
+        self.application.job_queue.run_repeating(self.reload_exchange_rates, interval=3600, first=5)
+
         logger.info("Scheduler started.")
 
     def run(self):
