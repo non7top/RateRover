@@ -97,7 +97,7 @@ class ExchangeRateBot:
             logger.error(f"Failed to load exchange rates: {e}")
             raise
 
-    def reload_exchange_rates(self):
+    async def reload_exchange_rates(self, *args):
         """Reload the exchange rates from the JSON file."""
         try:
             self.exchange_rates = self.load_exchange_rates()
@@ -126,11 +126,11 @@ class ExchangeRateBot:
                 if not previous or key not in previous:
                     return ""
                 current_rate = current.get(key, 0)
-                previous_rate = previous.get(key, {}).get(key, 0)
+                previous_rate = previous.get(key, {})
                 if current_rate > previous_rate:
-                    return '<span style="color: green;">↑</span>'  # Green up arrow
+                    return '↑ 💹'  # Green up arrow
                 elif current_rate < previous_rate:
-                    return '<span style="color: red;">↓</span>'  # Red down arrow
+                    return '↓ ❌'  # Red down arrow
                 return ""
 
             usd_trend = get_trend(usd, previous_rates.get("USD") if previous_rates else None, "buyingRate")
@@ -139,7 +139,7 @@ class ExchangeRateBot:
 
             return latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend
         except Exception as e:
-            logger.error(f"Failed to get latest rates: {e}")
+            logger.exception(f"Failed to get latest rates: {e}")
             raise
 
     def format_rates_message(self, latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend):
@@ -165,10 +165,10 @@ class ExchangeRateBot:
             await update.message.reply_text(message, parse_mode="HTML")
             logger.info(f"Rates sent to user {update.message.chat_id}.")
         except Exception as e:
-            logger.error(f"Failed to send rates to user {update.message.chat_id}: {e}")
+            logger.exception(f"Failed to send rates to user {update.message.chat_id}: {e}")
             await update.message.reply_text("An error occurred. Please try again later.")
 
-    async def send_daily_rates(self):
+    async def send_daily_rates(self, *args):
         """Send the daily exchange rates to all registered users."""
         try:
             latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend = self.get_latest_rates()
@@ -187,27 +187,16 @@ class ExchangeRateBot:
         except Exception as e:
             logger.error(f"Failed to send daily rates: {e}")
 
-    async def start_scheduler(self):
+    def start_scheduler(self):
         """Start the scheduler after the bot is running."""
-        self.scheduler.add_job(self.send_daily_rates, "cron", hour=10, minute=0)
-        self.scheduler.add_job(self.reload_exchange_rates, "cron", minute=10)  # Reload rates every hour at the 10th minute
-        self.scheduler.start()
+        self.application.job_queue.run_repeating(self.send_daily_rates, interval=600, first=10)
+        self.application.job_queue.run_repeating(self.reload_exchange_rates, interval=1800, first=5)
         logger.info("Scheduler started.")
 
     def run(self):
-        """Run the bot."""
-        try:
-            # Start the bot
-            logger.info("Bot is running...")
-            self.application.run_polling()
-        except Exception as e:
-            logger.error(f"Failed to run the bot: {e}")
-            raise
+        self.start_scheduler()
+        self.application.run_polling()
 
 if __name__ == "__main__":
     bot = ExchangeRateBot()
-    # Start the scheduler after the bot is running
-    bot.application.run_polling()
-    bot.scheduler.add_job(bot.send_daily_rates, "cron", hour=10, minute=0)
-    bot.scheduler.add_job(bot.reload_exchange_rates, "cron", minute=10)
-    bot.scheduler.start()
+    bot.run()

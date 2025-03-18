@@ -188,7 +188,7 @@ class SuperrichAPI:
             logger.info("Script completed successfully.")
 
         except Exception as e:
-            logger.error(f"Script failed with error: {e}")
+            logger.exception(f"Script failed with error: {e}")
 
 
 # Example usage
