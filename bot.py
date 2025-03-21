@@ -19,6 +19,101 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+class DatabaseHandler:
+    """Handles all database operations."""
+
+    def __init__(self, db_name: str = "users.db"):
+        self.db_name = db_name
+        self.conn = None
+        self.cursor = None
+        self.init_db()
+
+    def init_db(self):
+        """Initialize the SQLite database to store user chat IDs, timezones, and currencies."""
+        try:
+            self.conn = sqlite3.connect(self.db_name)
+            self.cursor = self.conn.cursor()
+
+            # Create the users table if it doesn't exist
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id INTEGER PRIMARY KEY,
+                    timezone TEXT DEFAULT 'Asia/Bangkok',
+                    currencies TEXT DEFAULT 'USD,RUB,EUR'
+                )
+            """)
+            self.conn.commit()
+            logger.info("Database initialized successfully.")
+        except Exception as e:
+            logger.exception("Failed to initialize database.")
+            raise
+
+    def add_user(self, chat_id: int):
+        """Add a user to the database if they don't already exist."""
+        try:
+            self.cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
+            self.conn.commit()
+            logger.info(f"User {chat_id} added to the database.")
+        except Exception as e:
+            logger.exception(f"Failed to add user {chat_id} to the database.")
+            raise
+
+    def update_timezone(self, chat_id: int, timezone: str):
+        """Update the user's timezone."""
+        try:
+            self.cursor.execute("UPDATE users SET timezone = ? WHERE chat_id = ?", (timezone, chat_id))
+            self.conn.commit()
+            logger.info(f"User {chat_id} updated timezone to {timezone}.")
+        except Exception as e:
+            logger.exception(f"Failed to update timezone for user {chat_id}.")
+            raise
+
+    def update_currencies(self, chat_id: int, currencies: str):
+        """Update the user's preferred currencies."""
+        try:
+            self.cursor.execute("UPDATE users SET currencies = ? WHERE chat_id = ?", (currencies, chat_id))
+            self.conn.commit()
+            logger.info(f"User {chat_id} updated currencies to {currencies}.")
+        except Exception as e:
+            logger.exception(f"Failed to update currencies for user {chat_id}.")
+            raise
+
+    def delete_user(self, chat_id: int):
+        """Delete a user from the database."""
+        try:
+            self.cursor.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+            self.conn.commit()
+            logger.info(f"User {chat_id} deleted from the database.")
+        except Exception as e:
+            logger.exception(f"Failed to delete user {chat_id}.")
+            raise
+
+    def get_user(self, chat_id: int):
+        """Get a user's data from the database."""
+        try:
+            self.cursor.execute("SELECT timezone, currencies FROM users WHERE chat_id = ?", (chat_id,))
+            return self.cursor.fetchone()
+        except Exception as e:
+            logger.exception(f"Failed to fetch user {chat_id}.")
+            raise
+
+    def get_all_users(self):
+        """Get all users from the database."""
+        try:
+            self.cursor.execute("SELECT chat_id, timezone, currencies FROM users")
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.exception("Failed to fetch all users.")
+            raise
+
+    def close(self):
+        """Close the database connection."""
+        if self.conn:
+            self.conn.close()
+            logger.info("Database connection closed.")
+
+
 class ExchangeRateBot:
     def __init__(self):
         # Get the bot token from the environment variable
@@ -30,6 +125,9 @@ class ExchangeRateBot:
         # Initialize the bot application
         self.application = Application.builder().token(self.bot_token).post_init(self.post_init).build()
 
+        # Initialize the database handler
+        self.db_handler = DatabaseHandler()
+
         # Add command handlers
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("rates", self.send_rates))
@@ -37,9 +135,6 @@ class ExchangeRateBot:
         self.application.add_handler(CommandHandler("unsubscribe", self.unsubscribe))
         self.application.add_handler(CommandHandler("listtimezones", self.list_timezones))
         self.application.add_handler(CommandHandler("setcurrencies", self.set_currencies))
-
-        # Initialize the database
-        self.init_db()
 
         # Initialize the scheduler
         self.scheduler = AsyncIOScheduler()
@@ -59,34 +154,13 @@ class ExchangeRateBot:
         ])
         logger.info("Bot commands have been set up.")
 
-    def init_db(self):
-        """Initialize the SQLite database to store user chat IDs, timezones, and currencies."""
-        try:
-            self.conn = sqlite3.connect("users.db")
-            self.cursor = self.conn.cursor()
-
-            # Create the users table if it doesn't exist
-            self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    chat_id INTEGER PRIMARY KEY,
-                    timezone TEXT DEFAULT 'Asia/Bangkok',
-                    currencies TEXT DEFAULT 'USD,RUB,EUR'
-                )
-            """)
-            self.conn.commit()
-            logger.info("Database initialized successfully.")
-        except Exception as e:
-            logger.exception("Failed to initialize database.")
-            raise
-
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler for the /start command."""
         chat_id = update.message.chat_id
 
         # Save the user's chat ID to the database if not already present
         try:
-            self.cursor.execute("INSERT OR IGNORE INTO users (chat_id) VALUES (?)", (chat_id,))
-            self.conn.commit()
+            self.db_handler.add_user(chat_id)
             logger.info(f"User {chat_id} started the bot.")
         except Exception as e:
             logger.exception(f"Failed to save user {chat_id} to the database.")
@@ -109,8 +183,7 @@ class ExchangeRateBot:
 
         if timezone and timezone in pytz.all_timezones:
             try:
-                self.cursor.execute("UPDATE users SET timezone = ? WHERE chat_id = ?", (timezone, chat_id))
-                self.conn.commit()
+                self.db_handler.update_timezone(chat_id, timezone)
                 await update.message.reply_text(f"Your timezone has been set to {timezone}.")
                 logger.info(f"User {chat_id} set timezone to {timezone}.")
             except Exception as e:
@@ -126,9 +199,7 @@ class ExchangeRateBot:
 
         if currencies:
             try:
-                # Validate currencies (e.g., check if they exist in the rates data)
-                self.cursor.execute("UPDATE users SET currencies = ? WHERE chat_id = ?", (currencies, chat_id))
-                self.conn.commit()
+                self.db_handler.update_currencies(chat_id, currencies)
                 await update.message.reply_text(f"Your preferred currencies have been set to {currencies}.")
                 logger.info(f"User {chat_id} set currencies to {currencies}.")
             except Exception as e:
@@ -142,9 +213,7 @@ class ExchangeRateBot:
         chat_id = update.message.chat_id
 
         try:
-            # Delete the user from the database
-            self.cursor.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
-            self.conn.commit()
+            self.db_handler.delete_user(chat_id)
             await update.message.reply_text("You have been unsubscribed from daily updates.")
             logger.info(f"User {chat_id} unsubscribed and removed from the database.")
         except Exception as e:
@@ -216,12 +285,11 @@ class ExchangeRateBot:
         chat_id = update.message.chat_id
         try:
             # Get user's preferred currencies
-            self.cursor.execute("SELECT currencies FROM users WHERE chat_id = ?", (chat_id,))
-            user = self.cursor.fetchone()
+            user = self.db_handler.get_user(chat_id)
             if not user:
                 await update.message.reply_text("You are not subscribed. Use /start to subscribe.")
                 return
-            currencies = user[0]
+            _, currencies = user
 
             latest_date, latest_rates, previous_rates = self.get_latest_rates()
             message = self.format_rates_message(latest_date, latest_rates, previous_rates, currencies)
@@ -237,8 +305,7 @@ class ExchangeRateBot:
             latest_date, latest_rates, previous_rates = self.get_latest_rates()
 
             # Fetch all users
-            self.cursor.execute("SELECT chat_id, timezone, currencies FROM users")
-            users = self.cursor.fetchall()
+            users = self.db_handler.get_all_users()
             for user in users:
                 chat_id, timezone, currencies = user
                 try:
@@ -269,6 +336,12 @@ class ExchangeRateBot:
     def run(self):
         self.start_scheduler()
         self.application.run_polling()
+
+    def __del__(self):
+        """Clean up resources when the bot is shut down."""
+        self.db_handler.close()
+        logger.info("Bot shut down and resources cleaned up.")
+
 
 if __name__ == "__main__":
     bot = ExchangeRateBot()
