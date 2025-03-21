@@ -36,6 +36,7 @@ class ExchangeRateBot:
         self.application.add_handler(CommandHandler("settimezone", self.set_timezone))
         self.application.add_handler(CommandHandler("unsubscribe", self.unsubscribe))
         self.application.add_handler(CommandHandler("listtimezones", self.list_timezones))
+        self.application.add_handler(CommandHandler("setcurrencies", self.set_currencies))
 
         # Initialize the database
         self.init_db()
@@ -54,37 +55,28 @@ class ExchangeRateBot:
             ("settimezone", "Set your preferred timezone (e.g., /settimezone Asia/Bangkok)"),
             ("unsubscribe", "Unsubscribe from daily updates"),
             ("listtimezones", "List all available timezones"),
+            ("setcurrencies", "Set your preferred currencies (e.g., /setcurrencies USD,RUB,EUR)"),
         ])
         logger.info("Bot commands have been set up.")
 
     def init_db(self):
-        """Initialize the SQLite database to store user chat IDs and timezones."""
+        """Initialize the SQLite database to store user chat IDs, timezones, and currencies."""
         try:
             self.conn = sqlite3.connect("users.db")
             self.cursor = self.conn.cursor()
-
-            # Check if the `timezone` column exists
-            self.cursor.execute("PRAGMA table_info(users)")
-            columns = self.cursor.fetchall()
-            column_names = [column[1] for column in columns]
-
-            if "timezone" not in column_names:
-                # Add the `timezone` column if it doesn't exist
-                self.cursor.execute("ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'Asia/Bangkok'")
-                self.conn.commit()
-                logger.info("Added 'timezone' column to the users table.")
 
             # Create the users table if it doesn't exist
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     chat_id INTEGER PRIMARY KEY,
-                    timezone TEXT DEFAULT 'Asia/Bangkok'
+                    timezone TEXT DEFAULT 'Asia/Bangkok',
+                    currencies TEXT DEFAULT 'USD,RUB,EUR'
                 )
             """)
             self.conn.commit()
             logger.info("Database initialized successfully.")
         except Exception as e:
-            logger.error(f"Failed to initialize database: {e}")
+            logger.exception("Failed to initialize database.")
             raise
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -97,13 +89,14 @@ class ExchangeRateBot:
             self.conn.commit()
             logger.info(f"User {chat_id} started the bot.")
         except Exception as e:
-            logger.error(f"Failed to save user {chat_id} to the database: {e}")
+            logger.exception(f"Failed to save user {chat_id} to the database.")
             await update.message.reply_text("An error occurred. Please try again later.")
             return
 
         await update.message.reply_text(
-            "Welcome! You will now receive daily exchange rates for USD, RUB, and EUR at 10 AM in your preferred timezone.\n\n"
+            "Welcome! You will now receive daily exchange rates for your preferred currencies at 10 AM in your preferred timezone.\n\n"
             "Use /settimezone to set your timezone (e.g., /settimezone Asia/Bangkok).\n"
+            "Use /setcurrencies to set your preferred currencies (e.g., /setcurrencies USD,RUB,EUR).\n"
             "Use /rates to get the latest exchange rates at any time.\n"
             "Use /unsubscribe to stop receiving daily updates.\n"
             "Use /listtimezones to see all available timezones."
@@ -121,22 +114,41 @@ class ExchangeRateBot:
                 await update.message.reply_text(f"Your timezone has been set to {timezone}.")
                 logger.info(f"User {chat_id} set timezone to {timezone}.")
             except Exception as e:
-                logger.error(f"Failed to update timezone for user {chat_id}: {e}")
+                logger.exception(f"Failed to update timezone for user {chat_id}.")
                 await update.message.reply_text("An error occurred. Please try again later.")
         else:
             await update.message.reply_text("Invalid timezone. Please provide a valid timezone (e.g., /settimezone Asia/Bangkok).")
+
+    async def set_currencies(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handler for the /setcurrencies command."""
+        chat_id = update.message.chat_id
+        currencies = context.args[0] if context.args else None
+
+        if currencies:
+            try:
+                # Validate currencies (e.g., check if they exist in the rates data)
+                self.cursor.execute("UPDATE users SET currencies = ? WHERE chat_id = ?", (currencies, chat_id))
+                self.conn.commit()
+                await update.message.reply_text(f"Your preferred currencies have been set to {currencies}.")
+                logger.info(f"User {chat_id} set currencies to {currencies}.")
+            except Exception as e:
+                logger.exception(f"Failed to update currencies for user {chat_id}.")
+                await update.message.reply_text("An error occurred. Please try again later.")
+        else:
+            await update.message.reply_text("Invalid currencies. Please provide a comma-separated list (e.g., /setcurrencies USD,RUB,EUR).")
 
     async def unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler for the /unsubscribe command."""
         chat_id = update.message.chat_id
 
         try:
+            # Delete the user from the database
             self.cursor.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
             self.conn.commit()
             await update.message.reply_text("You have been unsubscribed from daily updates.")
-            logger.info(f"User {chat_id} unsubscribed.")
+            logger.info(f"User {chat_id} unsubscribed and removed from the database.")
         except Exception as e:
-            logger.error(f"Failed to unsubscribe user {chat_id}: {e}")
+            logger.exception(f"Failed to unsubscribe user {chat_id}.")
             await update.message.reply_text("An error occurred. Please try again later.")
 
     async def list_timezones(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -152,7 +164,7 @@ class ExchangeRateBot:
             logger.info("Exchange rates loaded successfully.")
             return data
         except Exception as e:
-            logger.error(f"Failed to load exchange rates: {e}")
+            logger.exception("Failed to load exchange rates.")
             raise
 
     async def reload_exchange_rates(self, context: ContextTypes.DEFAULT_TYPE):
@@ -161,7 +173,7 @@ class ExchangeRateBot:
             self.exchange_rates = self.load_exchange_rates()
             logger.info(f"Exchange rates reloaded at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception as e:
-            logger.error(f"Failed to reload exchange rates: {e}")
+            logger.exception("Failed to reload exchange rates.")
 
     def get_latest_rates(self):
         """Get the latest date and rates for USD, RUB, and EUR."""
@@ -174,94 +186,83 @@ class ExchangeRateBot:
             latest_rates = self.exchange_rates[latest_date]["rates"]
             previous_rates = self.exchange_rates[previous_date]["rates"] if previous_date else None
 
-            # Extract USD, RUB, and EUR rates
-            usd = latest_rates.get("USD", {})
-            rub = latest_rates.get("RUB", {})
-            eur = latest_rates.get("EUR", {})
-
-            # Compare with previous rates
-            def get_trend(current, previous, key):
-                if not previous or key not in previous:
-                    return ""
-                current_rate = current.get(key, 0)
-                previous_rate = previous.get(key, {})
-                if current_rate > previous_rate:
-                    return '↑ 💹'  # Green up arrow
-                elif current_rate < previous_rate:
-                    return '↓ ❌'  # Red down arrow
-                return ""
-
-            usd_trend = get_trend(usd, previous_rates.get("USD") if previous_rates else None, "buyingRate")
-            rub_trend = get_trend(rub, previous_rates.get("RUB") if previous_rates else None, "buyingRate")
-            eur_trend = get_trend(eur, previous_rates.get("EUR") if previous_rates else None, "buyingRate")
-
-            return latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend
+            return latest_date, latest_rates, previous_rates
         except Exception as e:
-            logger.exception(f"Failed to get latest rates: {e}")
+            logger.exception("Failed to get latest rates.")
             raise
 
-    def format_rates_message(self, latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend):
+    def format_rates_message(self, latest_date, latest_rates, previous_rates, currencies):
         """Format the exchange rates into a message."""
-        return (
-            f"📅 Latest rates as of <b>{latest_date}</b>:\n\n"
-            f"🇺🇸 <b>USD (United States)</b>\n"
-            f"  Buying: {usd.get('buyingRate', 'N/A')} {usd_trend}\n"
-            f"  Selling: {usd.get('sellingRate', 'N/A')}\n\n"
-            f"🇷🇺 <b>RUB (Russia)</b>\n"
-            f"  Buying: {rub.get('buyingRate', 'N/A')} {rub_trend}\n"
-            f"  Selling: {rub.get('sellingRate', 'N/A')}\n\n"
-            f"🇪🇺 <b>EUR (European Union)</b>\n"
-            f"  Buying: {eur.get('buyingRate', 'N/A')} {eur_trend}\n"
-            f"  Selling: {eur.get('sellingRate', 'N/A')}\n"
-        )
+        message = f"📅 Latest rates as of <b>{latest_date}</b>:\n\n"
+        for currency in currencies.split(","):
+            if currency in latest_rates:
+                current_rate = latest_rates[currency].get("buyingRate", "N/A")
+                previous_rate = previous_rates.get(currency, {}).get("buyingRate", "N/A") if previous_rates else "N/A"
+                trend = ""
+                if previous_rate != "N/A":
+                    if current_rate > previous_rate:
+                        trend = '↑ 💹'
+                    elif current_rate < previous_rate:
+                        trend = '↓ ❌'
+                message += (
+                    f"🇺🇸 <b>{currency}</b>\n"
+                    f"  Buying: {current_rate} {trend}\n"
+                    f"  Selling: {latest_rates[currency].get('sellingRate', 'N/A')}\n\n"
+                )
+        return message
 
     async def send_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler for the /rates command."""
+        chat_id = update.message.chat_id
         try:
-            latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend = self.get_latest_rates()
-            message = self.format_rates_message(latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend)
+            # Get user's preferred currencies
+            self.cursor.execute("SELECT currencies FROM users WHERE chat_id = ?", (chat_id,))
+            user = self.cursor.fetchone()
+            if not user:
+                await update.message.reply_text("You are not subscribed. Use /start to subscribe.")
+                return
+            currencies = user[0]
+
+            latest_date, latest_rates, previous_rates = self.get_latest_rates()
+            message = self.format_rates_message(latest_date, latest_rates, previous_rates, currencies)
             await update.message.reply_text(message, parse_mode="HTML")
-            logger.info(f"Rates sent to user {update.message.chat_id}.")
+            logger.info(f"Rates sent to user {chat_id}.")
         except Exception as e:
-            logger.exception(f"Failed to send rates to user {update.message.chat_id}: {e}")
+            logger.exception(f"Failed to send rates to user {chat_id}.")
             await update.message.reply_text("An error occurred. Please try again later.")
 
-    async def send_hourly_rates(self, context: ContextTypes.DEFAULT_TYPE):
-        """Send the hourly exchange rates to users whose timezone matches the current hour."""
+    async def send_daily_rates(self, context: ContextTypes.DEFAULT_TYPE):
+        """Send the daily exchange rates to users whose local time is 10:00 AM."""
         try:
-            latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend = self.get_latest_rates()
-            message = self.format_rates_message(latest_date, usd, rub, eur, usd_trend, rub_trend, eur_trend)
+            latest_date, latest_rates, previous_rates = self.get_latest_rates()
 
-            # Get the current time in UTC
-            now_utc = datetime.now(pytz.utc)
-
-            # Fetch users whose timezone matches the current hour
-            self.cursor.execute("SELECT chat_id, timezone FROM users")
+            # Fetch all users
+            self.cursor.execute("SELECT chat_id, timezone, currencies FROM users")
             users = self.cursor.fetchall()
             for user in users:
-                chat_id, timezone = user
+                chat_id, timezone, currencies = user
                 try:
-                    tz = pytz.timezone(timezone)
-                    now_local = now_utc.astimezone(tz)
-                    if now_local.hour == 10 and now_local.minute == 0:  # Send at 10:00 in the user's timezone
-                        await self.application.bot.send_message(
-                            chat_id=chat_id,
-                            text=message,
-                            parse_mode="HTML"
-                        )
+                    # Get the current time in the user's timezone
+                    user_tz = pytz.timezone(timezone)
+                    now_local = datetime.now(user_tz)
+
+                    # Check if it's 10:00 AM in the user's timezone
+                    if now_local.hour == 10 and now_local.minute == 0:
+                        message = self.format_rates_message(latest_date, latest_rates, previous_rates, currencies)
+                        await self.application.bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
+                        logger.info(f"Daily rates sent to user {chat_id} in timezone {timezone}.")
                 except Exception as e:
-                    logger.error(f"Failed to send hourly rates to user {chat_id}: {e}")
-            logger.info(f"Hourly rates sent to users.")
+                    logger.exception(f"Failed to send daily rates to user {chat_id}.")
         except Exception as e:
-            logger.error(f"Failed to send hourly rates: {e}")
+            logger.exception("Failed to send daily rates.")
 
     def start_scheduler(self):
         """Start the scheduler after the bot is running."""
-        # Schedule send_hourly_rates to run every hour at the 10th minute
-        self.application.job_queue.run_repeating(self.send_hourly_rates, interval=3600, first=10)
+        # Schedule send_daily_rates to run every hour
+        self.application.job_queue.run_repeating(self.send_daily_rates, interval=3600)
 
         # Schedule reload_exchange_rates to run every hour at the 5th minute
-        self.application.job_queue.run_repeating(self.reload_exchange_rates, interval=3600, first=5)
+        self.application.job_queue.run_repeating(self.reload_exchange_rates, interval=3600, first=300)
 
         logger.info("Scheduler started.")
 
