@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import pytz
 
@@ -40,7 +40,8 @@ class DatabaseHandler:
                 CREATE TABLE IF NOT EXISTS users (
                     chat_id INTEGER PRIMARY KEY,
                     timezone TEXT DEFAULT 'Asia/Bangkok',
-                    currencies TEXT DEFAULT 'USD,RUB,EUR'
+                    currencies TEXT DEFAULT 'USD,RUB,EUR',
+                    timezone_offset INTEGER
                 )
             """)
             self.conn.commit()
@@ -48,6 +49,7 @@ class DatabaseHandler:
         except Exception as e:
             logger.exception("Failed to initialize database.")
             raise
+
 
     def add_user(self, chat_id: int):
         """Add a user to the database if they don't already exist."""
@@ -101,11 +103,12 @@ class DatabaseHandler:
     def get_all_users(self):
         """Get all users from the database."""
         try:
-            self.cursor.execute("SELECT chat_id, timezone, currencies FROM users")
+            self.cursor.execute("SELECT chat_id, timezone, currencies, timezone_offset FROM users")
             return self.cursor.fetchall()
         except Exception as e:
             logger.exception("Failed to fetch all users.")
             raise
+
 
     def close(self):
         """Close the database connection."""
@@ -135,6 +138,12 @@ class ExchangeRateBot:
         self.application.add_handler(CommandHandler("unsubscribe", self.unsubscribe))
         self.application.add_handler(CommandHandler("listtimezones", self.list_timezones))
         self.application.add_handler(CommandHandler("setcurrencies", self.set_currencies))
+        self.application.add_handler(CommandHandler("currencyrates", self.currency_rates))
+
+        # Add a reply handler for the currency prompt
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & filters.REPLY, self.handle_currency_reply)
+        )
 
         # Initialize the scheduler
         self.scheduler = AsyncIOScheduler()
@@ -151,6 +160,7 @@ class ExchangeRateBot:
             ("unsubscribe", "Unsubscribe from daily updates"),
             ("listtimezones", "List all available timezones"),
             ("setcurrencies", "Set your preferred currencies (e.g., /setcurrencies USD,RUB,EUR)"),
+            ("currencyrates", "Get historical rates for a specific currency (e.g., /currencyrates USD)"),
         ])
         logger.info("Bot commands have been set up.")
 
@@ -173,7 +183,8 @@ class ExchangeRateBot:
             "Use /setcurrencies to set your preferred currencies (e.g., /setcurrencies USD,RUB,EUR).\n"
             "Use /rates to get the latest exchange rates at any time.\n"
             "Use /unsubscribe to stop receiving daily updates.\n"
-            "Use /listtimezones to see all available timezones."
+            "Use /listtimezones to see all available timezones.\n"
+            "Use /currencyrates to get historical rates for a specific currency (e.g., /currencyrates USD)."
         )
 
     async def set_timezone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,14 +194,28 @@ class ExchangeRateBot:
 
         if timezone and timezone in pytz.all_timezones:
             try:
+                # Calculate the offset in hours (rounded to the nearest integer)
+                tz = pytz.timezone(timezone)
+                now = datetime.now(tz)
+                offset = now.utcoffset().total_seconds() / 3600  # Convert to hours
+                offset_int = int(round(offset))  # Round to the nearest integer
+
+                # Update the database with the timezone and offset
                 self.db_handler.update_timezone(chat_id, timezone)
-                await update.message.reply_text(f"Your timezone has been set to {timezone}.")
-                logger.info(f"User {chat_id} set timezone to {timezone}.")
+                self.db_handler.cursor.execute(
+                    "UPDATE users SET timezone_offset = ? WHERE chat_id = ?",
+                    (offset_int, chat_id)
+                )
+                self.db_handler.conn.commit()
+
+                await update.message.reply_text(f"Your timezone has been set to {timezone} (offset: UTC{offset_int:+d}).")
+                logger.info(f"User {chat_id} set timezone to {timezone} (offset: UTC{offset_int:+d}).")
             except Exception as e:
                 logger.exception(f"Failed to update timezone for user {chat_id}.")
                 await update.message.reply_text("An error occurred. Please try again later.")
         else:
             await update.message.reply_text("Invalid timezone. Please provide a valid timezone (e.g., /settimezone Asia/Bangkok).")
+
 
     async def set_currencies(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handler for the /setcurrencies command."""
@@ -299,6 +324,92 @@ class ExchangeRateBot:
             logger.exception(f"Failed to send rates to user {chat_id}.")
             await update.message.reply_text("An error occurred. Please try again later.")
 
+    async def currency_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handler for the /currencyrates command."""
+        chat_id = update.message.chat_id
+        currency = context.args[0].upper() if context.args else None
+
+        if not currency:
+            # Use force reply to prompt the user for a currency code
+            await update.message.reply_text(
+                "Please provide a currency code (e.g., USD, EUR, RUB):",
+                reply_markup={"force_reply": True}  # Enable force reply
+            )
+            return
+
+        # Process the currency code
+        await self.process_currency_rates(update, context, currency)
+
+    async def handle_currency_reply(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle the user's reply to the currency prompt."""
+        chat_id = update.message.chat_id
+        currency = update.message.text.upper()
+
+        # Process the currency code
+        await self.process_currency_rates(update, context, currency)
+
+    async def process_currency_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE, currency: str):
+        """Process the currency rates for the given currency."""
+        chat_id = update.message.chat_id  # Extract chat_id from the update object
+
+        try:
+            # Get the last 10 records, spaced every two days
+            sorted_dates = sorted(self.exchange_rates.keys(), reverse=True)
+            selected_dates = []
+            current_date = datetime.strptime(sorted_dates[0], "%Y-%m-%d")
+
+            for date in sorted_dates:
+                date_obj = datetime.strptime(date, "%Y-%m-%d")
+                if (current_date - date_obj).days % 2 == 0:
+                    selected_dates.append(date)
+                    if len(selected_dates) >= 10:
+                        break
+
+            # Extract buying rates for the selected dates
+            buying_rates = []
+            for date in selected_dates:
+                rates = self.exchange_rates[date]["rates"]
+                if currency in rates:
+                    buying_rate = rates[currency].get("buyingRate", 0)
+                    buying_rates.append((date, buying_rate))
+                else:
+                    buying_rates.append((date, None))  # Add None for missing data
+
+            if not buying_rates:
+                await update.message.reply_text(f"No data found for currency {currency}.")
+                return
+
+            # Filter out None values for min/max calculation
+            valid_rates = [rate for _, rate in buying_rates if rate is not None]
+            if not valid_rates:
+                await update.message.reply_text(f"No valid rates found for currency {currency}.")
+                return
+
+            # Find the minimum and maximum buying rates
+            min_rate = min(valid_rates)
+            max_rate = max(valid_rates)
+
+            # Prepare the bar graph
+            message = f"📊 Historical rates for <b>{currency}</b> (last 10 records, every 2 days):\n\n"
+            for date, rate in buying_rates:
+                if rate is not None:
+                    # Normalize the rate relative to the minimum rate
+                    normalized_rate = rate - min_rate
+                    max_normalized = max_rate - min_rate
+
+                    # Scale the bar to a fixed width (e.g., 20 characters)
+                    bar_length = int((normalized_rate / max_normalized) * 20) if max_normalized != 0 else 0
+                    bar = "▉" * bar_length  # Use block character for the bar
+                    message += f"📅 <b>{date}</b>\n  Buying Rate: {rate}\n  {bar}\n\n"
+                else:
+                    message += f"📅 <b>{date}</b>\n  No data for {currency}\n\n"
+
+            await update.message.reply_text(message, parse_mode="HTML")
+            logger.info(f"Currency rates sent to user {chat_id} for {currency}.")
+        except Exception as e:
+            logger.exception(f"Failed to send currency rates to user {chat_id}.")
+            await update.message.reply_text("An error occurred. Please try again later.")
+
     async def send_daily_rates(self, context: ContextTypes.DEFAULT_TYPE):
         """Send the daily exchange rates to users whose local time is 10:00 AM."""
         try:
@@ -307,21 +418,22 @@ class ExchangeRateBot:
             # Fetch all users
             users = self.db_handler.get_all_users()
             for user in users:
-                chat_id, timezone, currencies = user
+                chat_id, timezone, currencies, offset = user  # Include offset in the query
                 try:
-                    # Get the current time in the user's timezone
-                    user_tz = pytz.timezone(timezone)
-                    now_local = datetime.now(user_tz)
+                    # Calculate the user's local time based on their integer offset
+                    now_utc = datetime.utcnow()
+                    user_local_time = now_utc + timedelta(hours=offset)
 
-                    # Check if it's 10:00 AM in the user's timezone
-                    if now_local.hour == 10 and now_local.minute == 0:
+                    # Check if it's 10:00 AM in the user's local time
+                    if user_local_time.hour == 10 and user_local_time.minute == 0:
                         message = self.format_rates_message(latest_date, latest_rates, previous_rates, currencies)
                         await self.application.bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
-                        logger.info(f"Daily rates sent to user {chat_id} in timezone {timezone}.")
+                        logger.info(f"Daily rates sent to user {chat_id} in timezone {timezone} (offset: UTC{offset:+d}).")
                 except Exception as e:
                     logger.exception(f"Failed to send daily rates to user {chat_id}.")
         except Exception as e:
             logger.exception("Failed to send daily rates.")
+
 
     def start_scheduler(self):
         """Start the scheduler after the bot is running."""
